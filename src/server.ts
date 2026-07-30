@@ -17,7 +17,14 @@ async function main() {
   const redis = createRedisClient();
   const signingKey = await loadSigningKey(pem);
 
-  const app = buildApp({ pool, redis, signingKey });
+  // JWT_SECONDARY_KEY_PEM is optional and only ever published in JWKS, never
+  // signed with — it's the "kid 2개 공존" rotation slot (../PLAN.md §6):
+  // holds the next key ahead of a cutover, then the retiring key until its
+  // already-issued tokens expire. Absent outside a rotation window.
+  const secondaryPem = process.env.JWT_SECONDARY_KEY_PEM;
+  const secondaryKey = secondaryPem ? await loadSigningKey(secondaryPem) : undefined;
+
+  const app = buildApp({ pool, redis, signingKey, secondaryKey });
 
   // graceful shutdown (go-app 의 15s 미러)
   for (const signal of ["SIGTERM", "SIGINT"] as const) {

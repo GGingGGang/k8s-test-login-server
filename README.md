@@ -50,6 +50,7 @@ DB_SSL_REJECT_UNAUTHORIZED=false  # default false (HeatWave 서버 인증서에 
 LOG_LEVEL=info                    # default info
 APP_VERSION=<GIT_SHA>             # Dockerfile 이 주입 (기본 dev)
 JWT_PRIVATE_KEY_PEM=               # ES256 PEM 개인키 — 필수, never commit. 없으면 서버가 기동 실패
+JWT_SECONDARY_KEY_PEM=             # ES256 PEM — 선택. 키 회전 중에만 설정, JWKS 에 publish 만 되고 서명에는 안 쓰임 ("Key Rotation" 참고)
 JWT_ISSUER=auth.ggang.cloud        # access JWT 의 iss claim
 ACCESS_TTL=3600                   # access JWT TTL(초)
 REFRESH_TTL=1209600               # refresh 토큰 TTL(초, sliding) — 14d
@@ -78,6 +79,18 @@ OTEL_EXPORTER_OTLP_PROTOCOL=grpc       # OTLPTraceExporter(grpc) 고정
 - **Account lockout** — 비밀번호 불일치가 `LOGIN_LOCKOUT_THRESHOLD` 회 누적되면(`auth:loginfail:<user_id>`, TTL `LOGIN_LOCKOUT_WINDOW_SECONDS`) `users.status` 를 `active` → `locked` 로 전환(`PLAN.md` §6.3 ENUM)하고 Redis 카운터를 정리한다. 이미 잠긴 계정은 비밀번호가 맞아도 `401 {"error":"account_locked"}`. 로그인 성공 시 실패 카운터는 즉시 리셋된다.
 
 두 계층 모두 이메일 존재 여부를 흘리지 않도록 미가입 이메일도 동일하게 카운트된다.
+
+## Key Rotation
+
+`kid` 는 항상 키 자체에서(RFC 7638 JWK thumbprint) 계산되므로 (`src/keys.ts`), 회전은 PEM 을 바꿔치기하는 것만으로 새 `kid` 가 자동으로 따라온다. `POST /login`·`/refresh` 는 항상 `JWT_PRIVATE_KEY_PEM`(활성 서명 키)으로만 서명하고, `GET /.well-known/jwks.json` 은 이 키의 공개키에 더해 `JWT_SECONDARY_KEY_PEM`(설정된 경우)의 공개키도 함께 노출한다 — 이 두 번째 슬롯은 **절대 서명에 쓰이지 않고 JWKS 공개용으로만** 존재한다 (`src/routes/jwks.ts`).
+
+`PLAN.md` §6 이 정의하는 실제 회전 절차 (사람이 두 env 를 어떻게 바꾸는지):
+
+1. **사전 공개** — 새 키 페어를 생성해 그 PEM 을 `JWT_SECONDARY_KEY_PEM` 에 넣고 배포. `JWT_PRIVATE_KEY_PEM` 은 그대로(구 키가 계속 서명). JWKS 는 이제 구/신 키 둘 다 노출 — core 의 JWKS 캐시가 새 `kid` 를 미리 알게 된다. 최소 24h 유지.
+2. **전환(cutover)** — `JWT_PRIVATE_KEY_PEM` 을 새 키로, `JWT_SECONDARY_KEY_PEM` 을 구 키로 맞바꿔 배포. 서명은 이제 새 키로 전환되지만, 전환 이전에 발급된 access 토큰(구 키 서명)은 구 키가 여전히 JWKS 의 두 번째 슬롯에 있으므로 core 검증이 끊기지 않는다.
+3. **정리** — 구 키로 서명된 토큰의 `ACCESS_TTL` 이 전부 만료된 뒤 `JWT_SECONDARY_KEY_PEM` 을 비우고 재배포. JWKS 는 다시 키 1개로 돌아간다.
+
+이 절차가 실제로 무중단인지는 `src/keyRotation.test.ts` 가 Docker 없이 검증한다 — 두 개의 인메모리 앱 인스턴스로 "전환 전"/"전환 후"를 흉내내고, 전환 전에 구 키로 서명한 토큰이 전환 후 JWKS 로도 여전히 검증되는지 직접 확인한다.
 
 ## Observability
 
@@ -133,6 +146,10 @@ npm run test:integration  # 통합만 (vitest.integration.config.ts). Docker 데
 `src/router.test.ts` 는 `/openapi.json` 이 실제 구현된 엔드포인트만 노출하는지(`/documentation`, `/openapi.json` 자체는 스펙에서 숨김)를 DB 없이 검증한다.
 
 `src/observability/httpTracing.test.ts` 는 DB 없이 순수 Fastify 인스턴스로 W3C `traceparent` 헤더 전파(인바운드 trace id 를 그대로 이어받는지), 헤더가 없을 때 유효한 trace id 를 새로 발급하는지, span/로그에 PII 가 들어가지 않는지를 검증한다.
+
+`src/keyRotation.test.ts` 는 DB 없이 "Key Rotation" 섹션의 회전 절차를 검증한다 — 회전 전/후를 흉내낸 두 인메모리 앱 인스턴스로 JWKS 가 두 키를 동시에 노출하는지, 회전 전 구 키로 서명한 토큰이 회전 후 JWKS 로도 계속 검증되는지, 보조 키가 없을 때는 JWKS 가 키 1개만 노출하는지를 확인한다.
+
+`src/routes/auth-flow.integration.test.ts` 가 이미 register→login→JWKS 검증→refresh(회전)→refresh 재사용 감지→logout 전체 토큰 플로우를 e2e 로 검증한다 (2M 에 작성, 회귀 스위트로 계속 실행).
 
 `src/routes/register.integration.test.ts` 는 `@testcontainers/mysql` 로 실제 MySQL 컨테이너를 띄워 `0001_init` 마이그레이션 DDL을 적용한 뒤 `/register`를 검증한다 (성공 201, 이메일 중복 409).
 

@@ -30,6 +30,10 @@ export interface BuildAppOptions {
   pool?: Pool;
   redis: Redis;
   signingKey: SigningKey;
+  // secondaryKey, if set, is published in JWKS alongside signingKey but
+  // never used to sign — see JwksRouteOptions in routes/jwks.ts for the
+  // rotation runbook this backs (../PLAN.md §6 "kid 2개 공존").
+  secondaryKey?: SigningKey;
   tokenEnv?: TokenEnv;
   loginSecurityEnv?: LoginSecurityEnv;
 }
@@ -50,7 +54,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
   });
 
   const pool = options.pool ?? createDbPool();
-  const { redis, signingKey } = options;
+  const { redis, signingKey, secondaryKey } = options;
   const tokenEnv = options.tokenEnv ?? loadTokenEnv();
   const loginSecurityEnv = options.loginSecurityEnv ?? loadLoginSecurityEnv();
   const version = process.env.APP_VERSION ?? "dev";
@@ -104,7 +108,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     app.register(loginRoutes, { pool, redis, signingKey, tokenEnv, loginSecurityEnv });
     app.register(refreshRoutes, { redis, signingKey, tokenEnv });
     app.register(logoutRoutes, { redis });
-    app.register(jwksRoutes, { signingKey });
+    app.register(jwksRoutes, { signingKey, secondaryKey });
   });
 
   return app;
