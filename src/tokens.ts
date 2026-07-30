@@ -34,12 +34,39 @@ interface RefreshRecord {
   consumed: boolean;
 }
 
+// SessionRecord is the 5M session-management addition (../PLAN.md §7 "세션
+// 관리 API") — one row per refresh family, i.e. per login ("device"). It's
+// metadata alongside the family, not a replacement for it: RefreshRecord
+// stays the source of truth for whether a specific refresh token is valid.
+interface SessionRecord {
+  user_id: string;
+  created_at: string; // first login that started this family — never changes across rotations
+  last_active_at: string; // bumped on every rotation
+}
+
+export interface SessionSummary {
+  family_id: string;
+  created_at: string;
+  last_active_at: string;
+}
+
 function refreshKey(hash: string): string {
   return `auth:refresh:${hash}`;
 }
 
 function familyKey(familyId: string): string {
   return `auth:rtfam:${familyId}`;
+}
+
+function sessionKey(familyId: string): string {
+  return `auth:session:${familyId}`;
+}
+
+// userFamKey is the reverse index (user -> its families) GET/DELETE
+// /sessions need — nothing else in this file required looking up "all of a
+// user's families" before 5M.
+function userFamKey(userId: string): string {
+  return `auth:userfam:${userId}`;
 }
 
 function hashToken(token: string): string {
@@ -78,6 +105,32 @@ async function storeRefreshToken(
   await redis.expire(familyKey(record.family_id), ttlSeconds);
 }
 
+// touchSession keeps auth:session:<family> and the auth:userfam:<user>
+// reverse index in step with the family's sliding TTL — called on every
+// issueTokenPair (fresh login AND rotation) so a session's last_active_at
+// reflects actual use and its entry never expires out from under an
+// otherwise-still-valid family.
+async function touchSession(
+  redis: Redis,
+  familyId: string,
+  userId: string,
+  now: string,
+  isNewFamily: boolean,
+  ttlSeconds: number,
+): Promise<void> {
+  let createdAt = now;
+  if (!isNewFamily) {
+    const raw = await redis.get(sessionKey(familyId));
+    if (raw) {
+      createdAt = (JSON.parse(raw) as SessionRecord).created_at;
+    }
+  }
+  const session: SessionRecord = { user_id: userId, created_at: createdAt, last_active_at: now };
+  await redis.set(sessionKey(familyId), JSON.stringify(session), "EX", ttlSeconds);
+  await redis.sadd(userFamKey(userId), familyId);
+  await redis.expire(userFamKey(userId), ttlSeconds);
+}
+
 export interface IssueTokenPairParams {
   redis: Redis;
   signingKey: SigningKey;
@@ -90,17 +143,15 @@ export interface IssueTokenPairParams {
 // the caller's familyId so every descendant token stays revocable as a unit.
 export async function issueTokenPair(params: IssueTokenPairParams): Promise<TokenPair> {
   const { redis, signingKey, tokenEnv, userId } = params;
+  const isNewFamily = params.familyId === undefined;
   const familyId = params.familyId ?? randomUUID();
   const refreshToken = randomBytes(32).toString("base64url");
   const hash = hashToken(refreshToken);
+  const now = new Date().toISOString();
 
-  const record: RefreshRecord = {
-    user_id: userId,
-    family_id: familyId,
-    issued_at: new Date().toISOString(),
-    consumed: false,
-  };
+  const record: RefreshRecord = { user_id: userId, family_id: familyId, issued_at: now, consumed: false };
   await storeRefreshToken(redis, record, hash, tokenEnv.refreshTtlSeconds);
+  await touchSession(redis, familyId, userId, now, isNewFamily, tokenEnv.refreshTtlSeconds);
 
   const access = await signAccessToken(userId, signingKey, tokenEnv);
   return { accessToken: access.token, refreshToken, expiresIn: access.expiresIn };
@@ -148,12 +199,24 @@ export async function rotateRefreshToken(params: RotateRefreshTokenParams): Prom
   return { ok: true, pair };
 }
 
+// revokeFamily looks the session up by familyId (rather than requiring
+// callers to already know the owning user_id) so /logout and /refresh's
+// reuse-detection path — neither of which touched the session index before
+// 5M — didn't need to change.
 export async function revokeFamily(redis: Redis, familyId: string): Promise<void> {
+  const sessionRaw = await redis.get(sessionKey(familyId));
+
   const members = await redis.smembers(familyKey(familyId));
   if (members.length > 0) {
     await redis.del(...members.map(refreshKey));
   }
   await redis.del(familyKey(familyId));
+  await redis.del(sessionKey(familyId));
+
+  if (sessionRaw) {
+    const session = JSON.parse(sessionRaw) as SessionRecord;
+    await redis.srem(userFamKey(session.user_id), familyId);
+  }
 }
 
 export async function logoutByRefreshToken(redis: Redis, refreshToken: string): Promise<void> {
@@ -163,4 +226,34 @@ export async function logoutByRefreshToken(redis: Redis, refreshToken: string): 
 
   const record = JSON.parse(raw) as RefreshRecord;
   await revokeFamily(redis, record.family_id);
+}
+
+// listSessions backs GET /sessions (../PLAN.md §7 "세션 관리 API — family
+// 목록") — one entry per active login ("device"). A family_id present in
+// the reverse index whose session key already expired (TTL raced ahead of
+// an unused login) is dropped and the stale index entry self-heals away.
+export async function listSessions(redis: Redis, userId: string): Promise<SessionSummary[]> {
+  const familyIds = await redis.smembers(userFamKey(userId));
+  const sessions: SessionSummary[] = [];
+  for (const familyId of familyIds) {
+    const raw = await redis.get(sessionKey(familyId));
+    if (!raw) {
+      await redis.srem(userFamKey(userId), familyId);
+      continue;
+    }
+    const session = JSON.parse(raw) as SessionRecord;
+    sessions.push({ family_id: familyId, created_at: session.created_at, last_active_at: session.last_active_at });
+  }
+  return sessions.sort((a, b) => b.last_active_at.localeCompare(a.last_active_at));
+}
+
+// revokeSessionForUser backs DELETE /sessions/:familyId ("개별 폐기" /
+// force logout). Ownership is checked via the reverse index before
+// revoking — a familyId that exists but belongs to someone else returns
+// false so the route can 404 without leaking whether the id exists at all.
+export async function revokeSessionForUser(redis: Redis, userId: string, familyId: string): Promise<boolean> {
+  const isMember = await redis.sismember(userFamKey(userId), familyId);
+  if (!isMember) return false;
+  await revokeFamily(redis, familyId);
+  return true;
 }

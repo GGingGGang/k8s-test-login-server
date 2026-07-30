@@ -23,6 +23,8 @@ k8s 매니페스트는 [k8s-gitops](https://github.com/GGingGGang/k8s-gitops) �
 | POST | `/refresh` | `{refresh_token}` → refresh 회전(one-time use, sliding TTL `REFRESH_TTL`) 후 새 access+refresh 쌍 발급. 이미 소비된 토큰 재사용 시 401 + 해당 family 전체 폐기 |
 | POST | `/logout` | `{refresh_token}` → 토큰이 속한 family 전체를 Redis 에서 폐기. 알 수 없는 토큰이어도 204 (idempotent) |
 | GET | `/.well-known/jwks.json` | ES256 공개키 JWK set. `Cache-Control: max-age=3600`. `kid` 는 키의 RFC 7638 JWK thumbprint |
+| GET | `/sessions` | `Authorization: Bearer <access-token>` 필수 → 호출자의 활성 세션(로그인/기기) 목록 |
+| DELETE | `/sessions/{familyId}` | `Authorization: Bearer <access-token>` 필수 → 해당 세션 강제 로그아웃(refresh family 폐기). 소유자 아닌 family_id 는 404 |
 
 ## OpenAPI
 
@@ -91,6 +93,17 @@ OTEL_EXPORTER_OTLP_PROTOCOL=grpc       # OTLPTraceExporter(grpc) 고정
 3. **정리** — 구 키로 서명된 토큰의 `ACCESS_TTL` 이 전부 만료된 뒤 `JWT_SECONDARY_KEY_PEM` 을 비우고 재배포. JWKS 는 다시 키 1개로 돌아간다.
 
 이 절차가 실제로 무중단인지는 `src/keyRotation.test.ts` 가 Docker 없이 검증한다 — 두 개의 인메모리 앱 인스턴스로 "전환 전"/"전환 후"를 흉내내고, 전환 전에 구 키로 서명한 토큰이 전환 후 JWKS 로도 여전히 검증되는지 직접 확인한다.
+
+## Session Management
+
+`GET /sessions` / `DELETE /sessions/{familyId}` (`src/routes/sessions.ts`)은 `Authorization: Bearer <access-token>` 로 인증한다 — auth 가 자기 자신이 발급한 access 토큰을 검증하는 유일한 경로(`src/accessAuth.ts`, `jose.jwtVerify` 로 로컬 공개키 검증, core 처럼 JWKS 왕복은 안 함). `aud` 검증은 의도적으로 생략 — `aud=core` 로 발급된 토큰이라도 issuer 인 auth 자신이 자기 토큰을 들여다보는 것이므로 다른 relying party 로의 재생 방지라는 `aud` 의 존재 이유와 무관하다. 키 회전 중에도 끊기지 않도록 `signingKey`뿐 아니라 `secondaryKey`(설정된 경우)로도 검증을 시도한다.
+
+- **세션 = refresh token family**: 로그인마다 새 family 가 시작되므로(`src/tokens.ts` `issueTokenPair`) family 하나가 사실상 기기/로그인 하나. `auth:session:<family_id>`(`{user_id, created_at, last_active_at}`, family 와 동일한 sliding TTL)에 메타데이터를, `auth:userfam:<user_id>`(Set)에 "이 유저의 family 목록" 역인덱스를 함께 유지한다 — refresh 회전마다 `last_active_at` 만 갱신되고 `created_at`(최초 로그인 시각)은 유지된다.
+- **GET /sessions**: `auth:userfam:<user_id>` 를 순회해 세션 목록을 반환. 인덱스에는 있지만 세션 키가 이미 만료된 항목은 그 자리에서 제거(self-heal).
+- **DELETE /sessions/{familyId}**: `revokeFamily`(기존 `/logout`이 이미 쓰던 함수)를 재사용 — 특정 refresh 토큰 없이도 다른 기기를 지목해 강제 로그아웃할 수 있게 한 것뿐, 폐기 메커니즘 자체는 동일하다. 호출자 소유가 아닌 family_id 는 404(존재 여부 미노출).
+- **한계**: `../PLAN.md` §13 정정 #6 이 `/verify` introspection 을 폐기하고 JWKS 전용 로컬 검증으로 확정했기 때문에, 이미 발급된 access 토큰을 이 API 로 **즉시** 무효화할 방법은 없다 — 강제 로그아웃은 이후 refresh 를 막을 뿐이고, 아직 만료 전인 access 토큰은 `ACCESS_TTL` 만큼 그대로 유효하다(문서상 `auth:blk:<jti>` 블랙리스트 키가 언급돼 있었지만 이 아키텍처 결정과 맞지 않아 구현하지 않았다).
+
+`src/accessAuth.test.ts` 가 자체 검증 로직을(주 키/보조 키/서명자 불일치/잘못된 토큰 4케이스) Docker 없이 검증하고, `src/routes/sessions.integration.test.ts` 가 Redis testcontainers 로 목록 스코핑·회전 시 세션 미증식·강제 로그아웃 후 refresh 차단·타인 세션 폐기 시도 404 를 검증한다(MySQL 은 불요 — `issueTokenPair` 를 `/login` 대신 직접 호출해 로그인을 흉내낸다).
 
 ## Observability
 

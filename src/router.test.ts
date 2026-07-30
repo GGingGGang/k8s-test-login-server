@@ -32,6 +32,8 @@ describe("OpenAPI spec", () => {
       "/readyz",
       "/refresh",
       "/register",
+      "/sessions",
+      "/sessions/{familyId}",
     ]);
 
     await app.close();
